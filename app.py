@@ -7,9 +7,10 @@ import numpy as np
 import requests
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
+from flask_cors import CORS # 👈 1. IMPORT CORS
 
 # --- Part 1: Your Functions from the Notebook ---
-# (I've copied these directly from your .ipynb file)
+# (These are your existing functions, no changes needed here)
 
 def create_labels(df: pd.DataFrame, rain_thr_mm_h=10.0, humidity_thr_pct=80.0, pressure_drop_thr_hpa=5.0, wind_thr_kmh=50.0) -> pd.DataFrame:
     df = df.copy()
@@ -26,7 +27,7 @@ def create_labels(df: pd.DataFrame, rain_thr_mm_h=10.0, humidity_thr_pct=80.0, p
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df['datetime'] = pd.to_datetime(df['datetime']) # Ensure datetime is in the correct format
+    df['datetime'] = pd.to_datetime(df['datetime'])
     df["hour"] = df["datetime"].dt.hour
     df["dayofyear"] = df["datetime"].dt.dayofyear
     df["month"] = df["datetime"].dt.month
@@ -66,6 +67,7 @@ def fetch_open_meteo_hourly(lat: float, lon: float, days_back: int) -> pd.DataFr
     return df
 
 # --- Part 2: Model Training and Loading ---
+# (No changes needed here)
 
 MODEL_FILE = 'cloudburst_model.pkl'
 FEATURES = [
@@ -82,12 +84,10 @@ def train_and_save_model():
     from sklearn.impute import SimpleImputer
     
     print("🧠 Training new model...")
-    # Fetch a larger dataset for better training
     df_train = fetch_open_meteo_hourly(30.3165, 78.0322, days_back=90)
     df_train = create_labels(df_train)
     df_train = engineer_features(df_train)
     
-    # Handle missing values
     df_train = df_train.dropna(subset=['cloud_burst_risk'])
     X = df_train[FEATURES]
     y = df_train['cloud_burst_risk']
@@ -98,14 +98,11 @@ def train_and_save_model():
     model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
     model.fit(X_imputed, y)
     
-    # Save the imputer and model together
     joblib.dump({'model': model, 'imputer': imputer}, MODEL_FILE)
     print(f"✅ Model saved to {MODEL_FILE}")
     return {'model': model, 'imputer': imputer}
 
-# Load the model or train if it doesn't exist
 if not os.path.exists(MODEL_FILE):
-    print(f"⚠️ Model file {MODEL_FILE} not found. Training a new model...")
     pipeline = train_and_save_model()
 else:
     print(f"🚀 Loading existing model from {MODEL_FILE}")
@@ -114,15 +111,16 @@ else:
 model = pipeline['model']
 imputer = pipeline['imputer']
 
-
 # --- Part 3: Flask Web Server ---
 
 app = Flask(__name__)
+CORS(app) # 👈 2. ENABLE CORS FOR YOUR APP
 
 @app.route('/')
 def home():
     return "<h1>Cloudburst Prediction API</h1><p>Send a POST request to /predict</p>"
 
+# This is your full, working predict function
 @app.route('/predict', methods=['POST'])
 def predict():
     data = request.get_json()
@@ -133,19 +131,15 @@ def predict():
         return jsonify({'error': 'Latitude and Longitude are required.'}), 400
     
     try:
-        # Fetch the last 24 hours of data to calculate rolling features
         df_live = fetch_open_meteo_hourly(lat, lon, days_back=1)
         if df_live.empty:
             return jsonify({'error': 'Could not fetch live weather data.'}), 500
         
-        # Process features and get the most recent data point
         df_processed = engineer_features(df_live)
         latest_data = df_processed[FEATURES].tail(1)
         
-        # Handle potential NaNs in live data using the trained imputer
         latest_data_imputed = imputer.transform(latest_data)
 
-        # Make prediction
         prediction = model.predict(latest_data_imputed)
         probability = model.predict_proba(latest_data_imputed)
         
@@ -162,6 +156,4 @@ def predict():
         return jsonify({'error': f'An error occurred: {str(e)}'}), 500
 
 if __name__ == "__main__":
-    # The server will run on port 5000 by default.
-    # For deployment, a Gunicorn server will be used instead of this.
     app.run(debug=True)
