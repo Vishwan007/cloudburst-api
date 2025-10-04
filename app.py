@@ -7,7 +7,7 @@ import numpy as np
 import requests
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
-from flask_cors import CORS # 👈 1. IMPORT CORS
+from flask_cors import CORS
 
 # --- Part 1: Your Functions from the Notebook ---
 # (These are your existing functions, no changes needed here)
@@ -58,6 +58,9 @@ def fetch_open_meteo_hourly(lat: float, lon: float, days_back: int) -> pd.DataFr
     r.raise_for_status()
     data = r.json()
     hourly = data.get("hourly", {})
+    # Handle case where API returns empty lists for keys
+    if not all(k in hourly for k in ["time", "temperature_2m"]):
+        return pd.DataFrame()
     df = pd.DataFrame({
         "datetime": pd.to_datetime(hourly["time"]), "temperature": hourly.get("temperature_2m", []),
         "humidity": hourly.get("relative_humidity_2m", []), "precipitation": hourly.get("precipitation", []),
@@ -67,8 +70,6 @@ def fetch_open_meteo_hourly(lat: float, lon: float, days_back: int) -> pd.DataFr
     return df
 
 # --- Part 2: Model Training and Loading ---
-# (No changes needed here)
-
 MODEL_FILE = 'cloudburst_model.pkl'
 FEATURES = [
     'temperature', 'humidity', 'precipitation', 'pressure', 'wind_speed',
@@ -82,22 +83,17 @@ FEATURES = [
 def train_and_save_model():
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.impute import SimpleImputer
-    
     print("🧠 Training new model...")
     df_train = fetch_open_meteo_hourly(30.3165, 78.0322, days_back=90)
     df_train = create_labels(df_train)
     df_train = engineer_features(df_train)
-    
     df_train = df_train.dropna(subset=['cloud_burst_risk'])
     X = df_train[FEATURES]
     y = df_train['cloud_burst_risk']
-    
     imputer = SimpleImputer(strategy='mean')
     X_imputed = imputer.fit_transform(X)
-
     model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
     model.fit(X_imputed, y)
-    
     joblib.dump({'model': model, 'imputer': imputer}, MODEL_FILE)
     print(f"✅ Model saved to {MODEL_FILE}")
     return {'model': model, 'imputer': imputer}
@@ -112,15 +108,13 @@ model = pipeline['model']
 imputer = pipeline['imputer']
 
 # --- Part 3: Flask Web Server ---
-
 app = Flask(__name__)
-CORS(app) # 👈 2. ENABLE CORS FOR YOUR APP
+CORS(app)
 
 @app.route('/')
 def home():
     return "<h1>Cloudburst Prediction API</h1><p>Send a POST request to /predict</p>"
 
-# This is your full, working predict function
 @app.route('/predict', methods=['POST'])
 def predict():
     data = request.get_json()
@@ -132,19 +126,33 @@ def predict():
     
     try:
         df_live = fetch_open_meteo_hourly(lat, lon, days_back=1)
-        if df_live.empty:
-            return jsonify({'error': 'Could not fetch live weather data.'}), 500
+        if df_live.empty or df_live.isnull().all().all():
+            return jsonify({'error': 'Could not fetch valid live weather data.'}), 500
         
         df_processed = engineer_features(df_live)
         latest_data = df_processed[FEATURES].tail(1)
         
-        latest_data_imputed = imputer.transform(latest_data)
+        if latest_data.isnull().values.any():
+            print("Warning: NaNs detected in feature data before imputation.")
 
+        latest_data_imputed = imputer.transform(latest_data)
         prediction = model.predict(latest_data_imputed)
         probability = model.predict_proba(latest_data_imputed)
         
         is_risk = bool(prediction[0])
-        risk_prob = f"{probability[0][1] * 100:.2f}%"
+        
+        # --- THIS IS THE FIX FOR THE 'INDEX OUT OF BOUNDS' ERROR ---
+        # Check if the model returned probabilities for both classes (no risk, risk)
+        if probability.shape[1] > 1:
+            # If yes, get the probability of the "risk" class (which is at index 1)
+            risk_prob_val = probability[0][1]
+        else:
+            # If no, it means the model is 100% certain of one class.
+            # If the prediction is "no risk" (0), the risk probability is 0.
+            # If the prediction was "risk" (1), the risk probability would be 1.
+            risk_prob_val = 1.0 if is_risk else 0.0
+        
+        risk_prob = f"{risk_prob_val * 100:.2f}%"
 
         return jsonify({
             'location': {'lat': lat, 'lon': lon},
@@ -153,7 +161,9 @@ def predict():
         })
 
     except Exception as e:
-        return jsonify({'error': f'An error occurred: {str(e)}'}), 500
+        # Log the full error to the console on the server for easier debugging
+        print(f"An error occurred during prediction: {e}")
+        return jsonify({'error': f'An error occurred on the server: {str(e)}'}), 500
 
 if __name__ == "__main__":
     app.run(debug=True)
